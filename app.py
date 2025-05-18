@@ -12,7 +12,7 @@ import gc
 # Set page config
 st.set_page_config(page_title="Recipe Generator", page_icon="🍲", layout="wide")
 
-# Custom CSS for enhanced design
+# Custom CSS
 st.markdown("""
 <style>
     .main { background-color: #f8f9fa; padding: 20px; }
@@ -25,77 +25,21 @@ st.markdown("""
     .recipe-image { border-radius: 10px; max-width: 100%; }
     h1, h2 { color: #333; font-family: 'Arial', sans-serif; }
     .stTextArea textarea { border-radius: 5px; }
+    .stSpinner { margin-top: 20px; }
 </style>
 """, unsafe_allow_html=True)
 
-# Load or train model
-MODEL_PATH = "recipe_model.h5"
-
-@st.cache_resource
-def get_model():
-    if os.path.exists(MODEL_PATH):
-        try:
-            model = load_model(MODEL_PATH)
-            st.success("Loaded pre-trained model!")
-            return model
-        except Exception as e:
-            st.warning(f"Failed to load model: {e}. Training new model...")
-    
-    # Train new model
-    model = Sequential([
-        Dense(64, activation='relu', input_shape=(len(unique_ingredients),)),  # Reduced size
-        Dense(32, activation='relu'),
-        Dense(len(ddf), activation='softmax')
-    ])
-    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-    # Train with subset for Render
-    subset_size = min(1000, len(X_train))  # Limit to 1000 samples
-    model.fit(X_train[:subset_size], np.eye(len(ddf))[:subset_size], epochs=5, batch_size=32, verbose=1)
-    try:
-        model.save(MODEL_PATH)
-        st.success("Trained and saved new model!")
-    except Exception as e:
-        st.warning(f"Failed to save model: {e}")
-    return model
-
 # Data processing functions
-def convert_time_to_minutes(time_str):
-    if not time_str or not isinstance(time_str, str):
-        return 0
-    time_parts = time_str.split()
-    total_minutes = 0
-    for i in range(0, len(time_parts), 2):
-        try:
-            value = int(time_parts[i])
-            unit = time_parts[i+1].lower()
-            if 'hr' in unit:
-                total_minutes += value * 60
-            elif 'min' in unit:
-                total_minutes += value
-        except (ValueError, IndexError):
-            continue
-    return total_minutes
-
-def assign_difficulty(row):
-    prep_time_minutes = convert_time_to_minutes(row['Prep Time'])
-    cook_time_minutes = convert_time_to_minutes(row['Cook Time'])
-    total_time_minutes = prep_time_minutes + cook_time_minutes
-    if total_time_minutes <= 20:
-        return 'Easy'
-    elif 20 < total_time_minutes <= 40:
-        return 'Medium'
-    else:
-        return 'Hard'
-
 def extract_ingredient_names(ingredients):
     if not isinstance(ingredients, list):
         return []
     ingredient_names = []
     for ingredient in ingredients:
-        parts = ingredient.split()
-        parts = [part for part in parts if not any(c.isdigit() for c in part)]
-        ingredient_names.append(parts[-1].lower() if parts else "")
-    return ingredient_names
+        parts = ingredient.lower().split()
+        # Remove quantities, numbers, and descriptors
+        parts = [part for part in parts if not any(c.isdigit() for c in part) and part not in ('ml', 'g', 'tbsp', 'tsp', 'large', 'pack')]
+        ingredient_names.append(parts[-1] if parts else "")
+    return [name for name in ingredient_names if name]
 
 def encode_ingredients(recipe):
     encoding = np.zeros(len(unique_ingredients))
@@ -112,44 +56,74 @@ except FileNotFoundError:
     st.error("Dataset 'bbcgoodfood_recipes2.json' not found. Please upload the file.")
     st.stop()
 
-ddf['Dif'] = ddf.apply(assign_difficulty, axis=1)
+# Normalize data
 ddf['Ingredient Names'] = ddf['Ingredients'].apply(extract_ingredient_names)
 unique_ingredients = set([ingredient for ingredients_list in ddf['Ingredient Names'] for ingredient in ingredients_list if ingredient])
 ingredient_to_index = {ingredient: i for i, ingredient in enumerate(unique_ingredients)}
 ddf['Encoded Ingredients'] = ddf['Ingredient Names'].apply(encode_ingredients)
 X_train = np.array(list(ddf['Encoded Ingredients']))
 
-# Load model
+# Load or train model (simplified, but optional for filtering)
+MODEL_PATH = "recipe_model.h5"
+
+@st.cache_resource
+def get_model():
+    if os.path.exists(MODEL_PATH):
+        try:
+            model = load_model(MODEL_PATH)
+            st.success("Loaded pre-trained model!")
+            return model
+        except Exception as e:
+            st.warning(f"Failed to load model: {e}. Training new model...")
+    
+    # Train new model (minimal for Render)
+    model = Sequential([
+        Dense(16, activation='relu', input_shape=(len(unique_ingredients),)),
+        Dense(8, activation='relu'),
+        Dense(1, activation='sigmoid')  # Simplified output
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    subset_size = min(200, len(X_train))
+    # Dummy labels for simplicity (not used in filtering)
+    y_train = np.random.randint(0, 2, size=(subset_size,))
+    model.fit(X_train[:subset_size], y_train, epochs=3, batch_size=64, verbose=1)
+    try:
+        model.save(MODEL_PATH)
+        st.success("Trained and saved new model!")
+    except Exception as e:
+        st.warning(f"Failed to save model: {e}")
+    return model
+
 model = get_model()
 
-# Recipe recommendation function
-def recommend_recipes(available_ingredients, ddf, model, difficulty_level):
+# Recipe recommendation
+def recommend_recipes(available_ingredients, ddf, difficulty_level):
     available_ingredients = [ing.lower().strip() for ing in available_ingredients if ing.strip()]
     if not available_ingredients:
         return pd.DataFrame()
     available_ingredients_set = set(available_ingredients)
+    # Partial matching: at least one ingredient matches
     filtered_ddf = ddf[
-        (ddf['Ingredient Names'].apply(lambda x: available_ingredients_set.issubset(set(x)))) &
-        (ddf['Dif'].str.lower() == difficulty_level.lower())
+        (ddf['Ingredient Names'].apply(lambda x: any(ing in available_ingredients_set for ing in x))) &
+        (ddf['Difficulty'].str.lower() == difficulty_level.lower())
     ]
     if filtered_ddf.empty:
         return filtered_ddf
-    # Use model for ranking (optional, simplified for Render)
-    encodings = np.array(list(filtered_ddf['Encoded Ingredients']))
-    if encodings.size > 0:
-        predictions = model.predict(encodings, batch_size=32)
-        filtered_ddf = filtered_ddf.assign(Score=predictions.max(axis=1))
-        filtered_ddf = filtered_ddf.sort_values(by='Score', ascending=False)
-    return filtered_ddf.head(5)  # Limit to 5 recipes
+    # Sort by number of matching ingredients
+    filtered_ddf = filtered_ddf.assign(
+        MatchCount=ddf['Ingredient Names'].apply(lambda x: len(set(x) & available_ingredients_set))
+    )
+    filtered_ddf = filtered_ddf.sort_values(by='MatchCount', ascending=False)
+    return filtered_ddf.head(3)
 
 # Streamlit UI
 st.title("🍴 Recipe Generator")
-st.markdown("Enter your ingredients and select a difficulty level to find delicious recipes!")
+st.markdown("Discover delicious recipes based on your ingredients and skill level!")
 
 # Sidebar
 with st.sidebar:
     st.header("Recipe Settings")
-    available_ingredients = st.text_area("Enter ingredients (comma-separated, e.g., chicken, rice, tomato):", placeholder="chicken, rice, tomato").split(',')
+    available_ingredients = st.text_area("Enter ingredients (comma-separated):", placeholder="sugar, butter, flour").split(',')
     difficulty_level = st.selectbox("Difficulty Level", ["Easy", "Medium", "Hard"])
     generate_button = st.button("Generate Recipes")
 
@@ -159,17 +133,18 @@ with col1:
     st.subheader("Recommended Recipes")
     if generate_button:
         with st.spinner("Finding recipes..."):
-            filtered_ddf = recommend_recipes(available_ingredients, ddf, model, difficulty_level)
+            filtered_ddf = recommend_recipes(available_ingredients, ddf, difficulty_level)
             if not filtered_ddf.empty:
                 for _, row in filtered_ddf.iterrows():
                     with st.container():
                         st.markdown(f"<div class='recipe-card'>", unsafe_allow_html=True)
                         st.markdown(f"<div class='recipe-title'>{row.get('Title', 'Untitled Recipe')}</div>", unsafe_allow_html=True)
-                        st.markdown(f"<div class='recipe-details'>**Difficulty**: {row['Dif']}</div>", unsafe_allow_html=True)
+                        st.markdown(f"<div class='recipe-details'>**Difficulty**: {row.get('Difficulty', 'N/A')}</div>", unsafe_allow_html=True)
                         st.markdown(f"<div class='recipe-details'>**Prep Time**: {row.get('Prep Time', 'N/A')}</div>", unsafe_allow_html=True)
                         st.markdown(f"<div class='recipe-details'>**Cook Time**: {row.get('Cook Time', 'N/A')}</div>", unsafe_allow_html=True)
-                        st.markdown(f"<div class='recipe-details'>**Ingredients**: {', '.join(row['Ingredients'])}</div>", unsafe_allow_html=True)
-                        st.markdown(f"<div class='recipe-details'>**Instructions**: {row.get('Instructions', 'N/A')}</div>", unsafe_allow_html=True)
+                        st.markdown(f"<div class='recipe-details'>**Serves**: {row.get('Serves', 'N/A')}</div>", unsafe_allow_html=True)
+                        st.markdown(f"<div class='recipe-details'>**Ingredients**: {', '.join(row.get('Ingredients', []))}</div>", unsafe_allow_html=True)
+                        st.markdown(f"<div class='recipe-details'>**Instructions**: {', '.join(row.get('Method Steps', ['N/A']))}</div>", unsafe_allow_html=True)
                         st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.warning("No recipes found. Try different ingredients or difficulty level.")
